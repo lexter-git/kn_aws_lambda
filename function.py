@@ -223,7 +223,7 @@ def is_robot_in_error(rb: Dict[str, Any]) -> Tuple[bool, str]:
     error_sources = rb.get("error_sources")
     safety_violation = bool(rb.get("safety_field_violation", False))
 
-    bad_statuses = {"OFFLINE"}
+    bad_statuses = {"OFFLINE"}  # OFFLINE considerato errore
     mode_is_error = ("ERROR" in current_mode)
 
     in_error = (
@@ -269,6 +269,10 @@ def can_auto_clear(rb: Dict[str, Any]) -> Tuple[bool, str]:
     ok = (payload_fp == "NO_PAYLOAD") and (mode == "MODE_ERROR") and (status == "IDLE") and localized
     why = f"payload_footprint={payload_fp}, current_mode={mode}, status={status}, localized={localized}"
     return ok, why
+
+
+def is_offline(rb: Dict[str, Any]) -> bool:
+    return (rb.get("status") or "").upper() == "OFFLINE"
 
 
 # -------------------------
@@ -337,10 +341,17 @@ def notify_sns(topic_arn: str, subject: str, message: str) -> None:
 # Lambda entrypoint
 # -------------------------
 def lambda_handler(event, context):
+    # Topic standard (già esistente)
     topic_arn = os.environ.get("SNS_TOPIC_ARN")
+
+    # Topic dedicato OFFLINE (con le 3 email K+N come subscription)
+    offline_topic_arn = os.environ.get("OFFLINE_SNS_TOPIC_ARN")
+
     auto_clear = env_true("AUTO_CLEAR_ERROR", "false")
     auto_send_charge = env_true("AUTO_SEND_CHARGE", "false")
 
+    print(f"SNS_TOPIC_ARN = {topic_arn}")
+    print(f"OFFLINE_SNS_TOPIC_ARN = {offline_topic_arn}")
     print(f"AUTO_CLEAR_ERROR env = {auto_clear}")
     print(f"AUTO_SEND_CHARGE env = {auto_send_charge}")
     print(f"MAX_CLEAR_ATTEMPTS = {MAX_CLEAR_ATTEMPTS}")
@@ -364,7 +375,10 @@ def lambda_handler(event, context):
         )
     print("=== FINE LISTA ROBOT ===")
 
+    # Alert standard (mail già esistente) + alert offline (solo topic K+N)
     robot_alerts: List[str] = []
+    offline_alerts: List[str] = []
+
     robots_in_error_now: List[Dict[str, Any]] = []
     charge_triggered: List[Dict[str, Any]] = []
 
@@ -375,20 +389,38 @@ def lambda_handler(event, context):
         robot_name = rb.get("name") or ""
         display_name = rb.get("display_name") or robot_name or f"robot-{robot_id}"
 
+        # stato attuale
         in_error_now, reason = is_robot_in_error(rb)
-        prev_state = ddb_get_status(ddb_key).upper()  # "OK" / "ERROR" / ""
         curr_state = "ERROR" if in_error_now else "OK"
+        offline_now = is_offline(rb)
+
+        # stato precedente da DDB (per capire recovery OFFLINE)
+        prev_item = ddb_get_item(ddb_key)
+        prev_state = (prev_item.get("status") or "").upper()      # "OK" / "ERROR" / ""
+        prev_raw_status = (prev_item.get("raw_status") or "").upper()
 
         # Email: solo su cambio stato (o prima run se già ERROR)
         if prev_state != curr_state:
             if curr_state == "ERROR":
                 if prev_state:
-                    robot_alerts.append(f"❌ {display_name} è entrato in ERRORE ({reason})")
+                    msg = f"❌ {display_name} è entrato in ERRORE ({reason})"
                 else:
-                    robot_alerts.append(f"❌ {display_name} è attualmente in ERRORE ({reason})")
+                    msg = f"❌ {display_name} è attualmente in ERRORE ({reason})"
+
+                robot_alerts.append(msg)
+
+                # EXTRA recipients solo se OFFLINE
+                if offline_now:
+                    offline_alerts.append(msg)
+
             else:
                 if prev_state:
-                    robot_alerts.append(f"✅ {display_name} è tornato OK")
+                    msg = f"✅ {display_name} è tornato OK"
+                    robot_alerts.append(msg)
+
+                    # se prima era OFFLINE, notifichiamo anche al topic offline (ritorno online)
+                    if prev_raw_status == "OFFLINE":
+                        offline_alerts.append(msg)
 
         if in_error_now:
             robots_in_error_now.append({
@@ -425,10 +457,10 @@ def lambda_handler(event, context):
                 if not robot_name:
                     msg = f"⚠️ AUTO_CLEAR_ERROR attivo, ma robot_name mancante per {display_name} (id={robot_id})"
                     print(msg)
+                    # (Queste notifiche restano solo sul topic standard: NON vanno a K+N)
                     if prev_state != curr_state:
                         robot_alerts.append(msg)
                 else:
-                    # incrementiamo il tentativo PRIMA (così evitiamo loop in caso di crash)
                     new_attempts = attempts + 1
                     ddb_set_clear_attempts(robot_id, new_attempts)
 
@@ -449,6 +481,7 @@ def lambda_handler(event, context):
                                     print(f"<-- CHARGE OK per {robot_name}: {ch_resp}")
                                     charge_triggered.append({"robot_name": robot_name, "response": ch_resp})
 
+                                    # solo topic standard
                                     if prev_state != curr_state:
                                         robot_alerts.append(f"🔌 Inviato comando RICARICA per {display_name} (solo tentativo #1)")
                                 except Exception as ce:
@@ -463,7 +496,7 @@ def lambda_handler(event, context):
                             elif new_attempts != 1:
                                 print(f"--> CHARGE: tentativo clear #{new_attempts}, non reinvio ricarica (solo #1).")
 
-                        # Non spammare email: aggiungi dettaglio solo se c'è cambio stato
+                        # solo topic standard
                         if prev_state != curr_state:
                             robot_alerts.append(
                                 f"🧹 Clear error inviato per {display_name} (robot_name={robot_name}) "
@@ -490,15 +523,27 @@ def lambda_handler(event, context):
             }
         )
 
+    # ===== Publish SNS: standard =====
     if robot_alerts and topic_arn:
         notify_sns(
             topic_arn=topic_arn,
             subject="AMR – Stato/variazioni robot",
             message="\n".join(robot_alerts)
         )
-        print("Notifica robot inviata via SNS.")
+        print("Notifica robot (standard) inviata via SNS.")
     else:
-        print("Nessuna notifica robot (o SNS_TOPIC_ARN non impostato).")
+        print("Nessuna notifica robot standard (o SNS_TOPIC_ARN non impostato).")
+
+    # ===== Publish SNS: OFFLINE-only =====
+    if offline_alerts and offline_topic_arn:
+        notify_sns(
+            topic_arn=offline_topic_arn,
+            subject="AMR – OFFLINE",
+            message="\n".join(offline_alerts)
+        )
+        print("Notifica robot OFFLINE inviata via SNS (topic dedicato).")
+    else:
+        print("Nessuna notifica OFFLINE (o OFFLINE_SNS_TOPIC_ARN non impostato, o nessun offline).")
 
     # =========================
     # 2) EVENTI: Incomplete > 30 minuti + anti-spam su lista
@@ -562,6 +607,7 @@ def lambda_handler(event, context):
         "auto_clear_enabled": auto_clear,
         "auto_send_charge_enabled": auto_send_charge,
         "robot_alerts_sent": robot_alerts,
+        "offline_alerts_sent": offline_alerts,
         "robots_in_error_now": robots_in_error_now,
         "charge_triggered": charge_triggered,
         "robots_count": len(robots),
