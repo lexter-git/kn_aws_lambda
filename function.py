@@ -32,6 +32,8 @@ CHARGE_TRIGGER_URL_BY_ROBOT_NAME: Dict[str, str] = {
 ROBOT_ERROR_KEY_PREFIX = "robot:"                 # key stato sintetico "robot:<id>"
 INCOMPLETE_EVENTS_KEY = "__incomplete_events__"   # key fissa anti-spam eventi
 CLEAR_ATTEMPTS_KEY_PREFIX = "clear_attempts:"     # key contatore clear "clear_attempts:<id>"
+ESCALATED_KEY_PREFIX = "escalated:"               # key flag escalation "escalated:<id>"
+
 MAX_CLEAR_ATTEMPTS = 5
 
 
@@ -326,6 +328,21 @@ def ddb_get_clear_attempts(robot_id: str) -> int:
     return ddb_get_int(key, "attempts", 0)
 
 
+def ddb_set_escalated(robot_id: str, escalated: bool) -> None:
+    key = f"{ESCALATED_KEY_PREFIX}{robot_id}"
+    ddb_put_item({
+        "robot_id": key,
+        "escalated": bool(escalated),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+def ddb_get_escalated(robot_id: str) -> bool:
+    key = f"{ESCALATED_KEY_PREFIX}{robot_id}"
+    item = ddb_get_item(key)
+    return bool(item.get("escalated", False))
+
+
 # -------------------------
 # SNS
 # -------------------------
@@ -347,11 +364,15 @@ def lambda_handler(event, context):
     # Topic dedicato OFFLINE (con le 3 email K+N come subscription)
     offline_topic_arn = os.environ.get("OFFLINE_SNS_TOPIC_ARN")
 
+    # Topic escalation (il tuo: amr-5-clear-error) - altre email da notificare solo dopo 5 tentativi
+    escalation_topic_arn = os.environ.get("ESCALATION_SNS_TOPIC_ARN")
+
     auto_clear = env_true("AUTO_CLEAR_ERROR", "false")
     auto_send_charge = env_true("AUTO_SEND_CHARGE", "false")
 
     print(f"SNS_TOPIC_ARN = {topic_arn}")
     print(f"OFFLINE_SNS_TOPIC_ARN = {offline_topic_arn}")
+    print(f"ESCALATION_SNS_TOPIC_ARN = {escalation_topic_arn}")
     print(f"AUTO_CLEAR_ERROR env = {auto_clear}")
     print(f"AUTO_SEND_CHARGE env = {auto_send_charge}")
     print(f"MAX_CLEAR_ATTEMPTS = {MAX_CLEAR_ATTEMPTS}")
@@ -375,9 +396,10 @@ def lambda_handler(event, context):
         )
     print("=== FINE LISTA ROBOT ===")
 
-    # Alert standard (mail già esistente) + alert offline (solo topic K+N)
+    # Alert standard (mail già esistente) + alert offline (solo topic K+N) + escalation
     robot_alerts: List[str] = []
     offline_alerts: List[str] = []
+    escalation_alerts: List[str] = []
 
     robots_in_error_now: List[Dict[str, Any]] = []
     charge_triggered: List[Dict[str, Any]] = []
@@ -437,12 +459,16 @@ def lambda_handler(event, context):
             })
             print(f"!!! ERRORE su {display_name}: {reason}")
 
-        # Se il robot è OK: azzera contatore tentativi clear
+        # Se il robot è OK: azzera contatore tentativi clear + reset escalation
         if not in_error_now:
             attempts = ddb_get_clear_attempts(robot_id)
             if attempts != 0:
                 print(f"Reset clear attempts per {display_name} (robot_id={robot_id}) da {attempts} a 0 (robot OK).")
                 ddb_set_clear_attempts(robot_id, 0)
+
+            if ddb_get_escalated(robot_id):
+                print(f"Reset escalation flag per {display_name} (robot_id={robot_id}) (robot OK).")
+                ddb_set_escalated(robot_id, False)
 
         # Auto clear: riprova ad ogni esecuzione finché in errore, ma max 5 tentativi totali
         if auto_clear and in_error_now:
@@ -511,11 +537,33 @@ def lambda_handler(event, context):
                                 f"[tentativo {new_attempts}/{MAX_CLEAR_ATTEMPTS}]"
                             )
 
+        # ========= ESCALATION =========
+        # Se siamo ancora in errore e abbiamo raggiunto i 5 tentativi, manda UNA mail extra (topic dedicato)
+        attempts_now = ddb_get_clear_attempts(robot_id)
+        if in_error_now and attempts_now >= MAX_CLEAR_ATTEMPTS:
+            if not ddb_get_escalated(robot_id):
+                ddb_set_escalated(robot_id, True)
+
+                esc_msg = (
+                    f"🚨 ESCALATION: {display_name} ancora in ERRORE dopo {attempts_now}/{MAX_CLEAR_ATTEMPTS} tentativi di clear.\n"
+                    f"- reason: {reason}\n"
+                    f"- status: {rb.get('status')} | mode: {rb.get('current_mode')} | payload: {rb.get('payload_footprint')} | localized: {rb.get('localized')}\n"
+                    f"- ip: {rb.get('ip')}\n"
+                    f"- last_status_change: {rb.get('last_status_change')}\n"
+                    f"- robot_id: {robot_id} | robot_name: {robot_name}"
+                )
+                escalation_alerts.append(esc_msg)
+                print(f"ESCALATION attivata per {display_name}.")
+            else:
+                print(f"ESCALATION già inviata in precedenza per {display_name}, non rinotifico.")
+
         # Salva stato sintetico
         ddb_put_status(
             key=ddb_key,
             status=curr_state,
             extra={
+                "robot_name": robot_name,
+                "display_name": display_name,
                 "raw_status": rb.get("status") or "",
                 "raw_mode": rb.get("current_mode") or "",
                 "raw_payload_footprint": rb.get("payload_footprint") if rb.get("payload_footprint") is not None else "",
@@ -544,6 +592,17 @@ def lambda_handler(event, context):
         print("Notifica robot OFFLINE inviata via SNS (topic dedicato).")
     else:
         print("Nessuna notifica OFFLINE (o OFFLINE_SNS_TOPIC_ARN non impostato, o nessun offline).")
+
+    # ===== Publish SNS: ESCALATION (5 tentativi clear) =====
+    if escalation_alerts and escalation_topic_arn:
+        notify_sns(
+            topic_arn=escalation_topic_arn,
+            subject="AMR – ESCALATION: clear_error non risolto (5 tentativi)",
+            message="\n\n".join(escalation_alerts)
+        )
+        print("Notifica ESCALATION inviata via SNS (topic dedicato).")
+    else:
+        print("Nessuna notifica ESCALATION (o ESCALATION_SNS_TOPIC_ARN non impostato, o nessuna escalation).")
 
     # =========================
     # 2) EVENTI: Incomplete > 30 minuti + anti-spam su lista
@@ -608,6 +667,7 @@ def lambda_handler(event, context):
         "auto_send_charge_enabled": auto_send_charge,
         "robot_alerts_sent": robot_alerts,
         "offline_alerts_sent": offline_alerts,
+        "escalation_alerts_sent": escalation_alerts,
         "robots_in_error_now": robots_in_error_now,
         "charge_triggered": charge_triggered,
         "robots_count": len(robots),
