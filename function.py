@@ -26,6 +26,7 @@ CHARGE_TRIGGER_URL_BY_ROBOT_NAME: Dict[str, str] = {
     "freight100-2424": "https://iveco.robots.zebrasymmetry.com/api/v1/trigger/9ed4cf80-2a7c-406e-a207-2d27a7f37a07/activate",
     "freight100-2439": "https://iveco.robots.zebrasymmetry.com/api/v1/trigger/61994945-8d50-4e42-9eb2-dfb20a50636f/activate",
     "freight100-2177": "https://iveco.robots.zebrasymmetry.com/api/v1/trigger/a740ba57-bc6b-46d8-96dc-7e7c8338376f/activate",
+    "freight100-1692": "https://iveco.robots.zebrasymmetry.com/api/v1/trigger/4f7232aa-99a0-4cba-955b-66042ca400a8/activate",
 }
 
 # ===== Constants =====
