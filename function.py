@@ -29,6 +29,14 @@ CHARGE_TRIGGER_URL_BY_ROBOT_NAME: Dict[str, str] = {
     "freight100-1692": "https://iveco.robots.zebrasymmetry.com/api/v1/trigger/4f7232aa-99a0-4cba-955b-66042ca400a8/activate",
 }
 
+# Trigger ricarica per bassa batteria (<30%) per specifici robot
+LOW_BATTERY_CHARGE_TRIGGER_URL_BY_ROBOT_NAME: Dict[str, str] = {
+    "freight100-1692": "https://iveco.robots.zebrasymmetry.com/api/v1/trigger/ddbe865f-96f5-4df2-8fcd-d198d0aea98f/activate",
+    "freight100-2177": "https://iveco.robots.zebrasymmetry.com/api/v1/trigger/1fc59213-c5a1-491a-8ecb-7e238cfbcb01/activate",
+    "freight100-2424": "https://iveco.robots.zebrasymmetry.com/api/v1/trigger/fd085e44-2809-4bb3-a9c9-02ed4c632450/activate",
+    "freight100-2439": "https://iveco.robots.zebrasymmetry.com/api/v1/trigger/ba541ae2-26c0-4e2c-a692-8197cecaad99/activate",
+}
+
 # ===== Constants =====
 ROBOT_ERROR_KEY_PREFIX = "robot:"                 # key stato sintetico "robot:<id>"
 INCOMPLETE_EVENTS_KEY = "__incomplete_events__"   # key fissa anti-spam eventi
@@ -36,6 +44,10 @@ CLEAR_ATTEMPTS_KEY_PREFIX = "clear_attempts:"     # key contatore clear "clear_a
 ESCALATED_KEY_PREFIX = "escalated:"               # key flag escalation "escalated:<id>"
 
 MAX_CLEAR_ATTEMPTS = 5
+
+BATTERY_STATE_URL_TEMPLATE = "https://iveco.robots.zebrasymmetry.com/api/v3/robots/{robot_name}/state"
+LOW_BATTERY_THRESHOLD = 0.30
+BATTERY_LOW_KEY_PREFIX = "battery_low:"          # key flag bassa batteria "battery_low:<id>"
 
 
 # -------------------------
@@ -192,6 +204,11 @@ def fetch_incomplete_events(token: str) -> List[Dict[str, Any]]:
     return results
 
 
+def fetch_robot_state(token: str, robot_name: str) -> Dict[str, Any]:
+    url = BATTERY_STATE_URL_TEMPLATE.format(robot_name=robot_name)
+    return _http_get_json(url, headers={"Authorization": f"Bearer {token}"})
+
+
 def trigger_clear_error(token: str, robot_name: str) -> Dict[str, Any]:
     payload = {"robot_name": robot_name, "payload_footprint": None}
     return _http_post_json(
@@ -344,6 +361,21 @@ def ddb_get_escalated(robot_id: str) -> bool:
     return bool(item.get("escalated", False))
 
 
+def ddb_set_battery_low(robot_id: str, value: bool) -> None:
+    key = f"{BATTERY_LOW_KEY_PREFIX}{robot_id}"
+    ddb_put_item({
+        "robot_id": key,
+        "battery_low": bool(value),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+def ddb_get_battery_low(robot_id: str) -> bool:
+    key = f"{BATTERY_LOW_KEY_PREFIX}{robot_id}"
+    item = ddb_get_item(key)
+    return bool(item.get("battery_low", False))
+
+
 # -------------------------
 # SNS
 # -------------------------
@@ -404,6 +436,7 @@ def lambda_handler(event, context):
 
     robots_in_error_now: List[Dict[str, Any]] = []
     charge_triggered: List[Dict[str, Any]] = []
+    battery_alerts: List[str] = []
 
     for rb in robots:
         robot_id = str(rb.get("id"))
@@ -558,6 +591,40 @@ def lambda_handler(event, context):
             else:
                 print(f"ESCALATION già inviata in precedenza per {display_name}, non rinotifico.")
 
+        # ========= BASSA BATTERIA =========
+        if robot_name:
+            try:
+                state = fetch_robot_state(token=token, robot_name=robot_name)
+                battery_level = state.get("battery_level")
+                if battery_level is not None:
+                    battery_pct = float(battery_level)
+                    print(f"Batteria {display_name}: {battery_pct:.1%}")
+                    if battery_pct < LOW_BATTERY_THRESHOLD:
+                        if not ddb_get_battery_low(robot_id):
+                            ddb_set_battery_low(robot_id, True)
+                            low_msg = f"🔋 {display_name} batteria bassa: {battery_pct:.0%}"
+                            print(f"BASSA BATTERIA rilevata per {display_name}: {battery_pct:.1%}")
+                            battery_alerts.append(low_msg)
+                            if offline_now:
+                                print(f"--> CHARGE (bassa batteria): {display_name} è OFFLINE, non invio trigger ricarica.")
+                            elif robot_name in LOW_BATTERY_CHARGE_TRIGGER_URL_BY_ROBOT_NAME:
+                                try:
+                                    batt_url = LOW_BATTERY_CHARGE_TRIGGER_URL_BY_ROBOT_NAME[robot_name]
+                                    _http_post_empty(batt_url, headers={"Authorization": f"Bearer {token}"})
+                                    print(f"Trigger ricarica bassa batteria inviato per {robot_name}.")
+                                    battery_alerts.append(f"🔌 Trigger ricarica inviato per {display_name}")
+                                except Exception as bte:
+                                    print(f"Trigger ricarica bassa batteria FALLITO per {robot_name}: {bte}")
+                                    battery_alerts.append(f"⚠️ Trigger ricarica FALLITO per {display_name}: {bte}")
+                        else:
+                            print(f"Bassa batteria già notificata per {display_name}, non rinotifico.")
+                    else:
+                        if ddb_get_battery_low(robot_id):
+                            print(f"Reset battery_low per {display_name} (batteria OK: {battery_pct:.1%}).")
+                            ddb_set_battery_low(robot_id, False)
+            except Exception as bex:
+                print(f"Errore lettura stato batteria per {display_name}: {bex}")
+
         # Salva stato sintetico
         ddb_put_status(
             key=ddb_key,
@@ -604,6 +671,17 @@ def lambda_handler(event, context):
         print("Notifica ESCALATION inviata via SNS (topic dedicato).")
     else:
         print("Nessuna notifica ESCALATION (o ESCALATION_SNS_TOPIC_ARN non impostato, o nessuna escalation).")
+
+    # ===== Publish SNS: BASSA BATTERIA =====
+    if battery_alerts and topic_arn:
+        notify_sns(
+            topic_arn=topic_arn,
+            subject="AMR – Batteria bassa (<30%)",
+            message="\n".join(battery_alerts)
+        )
+        print("Notifica bassa batteria inviata via SNS.")
+    else:
+        print("Nessuna notifica bassa batteria (o SNS_TOPIC_ARN non impostato, o batterie OK).")
 
     # =========================
     # 2) EVENTI: Incomplete > 30 minuti + anti-spam su lista
@@ -669,6 +747,7 @@ def lambda_handler(event, context):
         "robot_alerts_sent": robot_alerts,
         "offline_alerts_sent": offline_alerts,
         "escalation_alerts_sent": escalation_alerts,
+        "battery_alerts_sent": battery_alerts,
         "robots_in_error_now": robots_in_error_now,
         "charge_triggered": charge_triggered,
         "robots_count": len(robots),
