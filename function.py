@@ -50,6 +50,12 @@ MAX_CLEAR_ATTEMPTS = 5
 # LOW_BATTERY_THRESHOLD = 0.30
 # BATTERY_LOW_KEY_PREFIX = "battery_low:"          # key flag bassa batteria "battery_low:<id>"
 
+# ===== CHARGE ZONE CHECK (robot fermo in zona ricarica senza caricare) =====
+ROBOT_STATE_URL_TEMPLATE = "https://iveco.robots.zebrasymmetry.com/api/v3/robots/{robot_name}/state"
+
+CHARGE_ZONE_KEY_PREFIX = "charge_zone:"           # key stato "charge_zone:<id>" (count + notified)
+CHARGE_ZONE_MIN_CHECKS = int(os.environ.get("CHARGE_ZONE_MIN_CHECKS", "5"))
+
 
 # -------------------------
 # Env helpers
@@ -57,6 +63,23 @@ MAX_CLEAR_ATTEMPTS = 5
 def env_true(name: str, default: str = "false") -> bool:
     v = (os.environ.get(name, default) or "").strip().lower()
     return v in ("1", "true", "yes", "y", "on")
+
+
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# Poligono di controllo zona ricarica (ordine dei vertici = perimetro).
+# Valori di default = coordinate fornite; sovrascrivibili via env var.
+CHARGE_CHECK_POLYGON: List[Tuple[float, float]] = [
+    (env_float("CHARGE_CHECK_1_X", -9.4124478998544), env_float("CHARGE_CHECK_1_Y", 52.820903377498375)),
+    (env_float("CHARGE_CHECK_2_X", -5.500045575641971), env_float("CHARGE_CHECK_2_Y", 50.40899924240087)),
+    (env_float("CHARGE_CHECK_3_X", -6.430233749907276), env_float("CHARGE_CHECK_3_Y", 48.845551649598306)),
+    (env_float("CHARGE_CHECK_4_X", -10.495594559204292), env_float("CHARGE_CHECK_4_Y", 51.14233639828378)),
+]
 
 
 # -------------------------
@@ -205,6 +228,14 @@ def fetch_incomplete_events(token: str) -> List[Dict[str, Any]]:
     return results
 
 
+def fetch_robot_state(token: str, robot_name: str) -> Dict[str, Any]:
+    """
+    Stato v3 del robot (usato per leggere current_pose.x/y per il check zona ricarica).
+    """
+    url = ROBOT_STATE_URL_TEMPLATE.format(robot_name=robot_name)
+    return _http_get_json(url, headers={"Authorization": f"Bearer {token}"})
+
+
 # [BATTERIA DISABILITATA]
 # def fetch_robot_state(token: str, robot_name: str) -> Dict[str, Any]:
 #     url = BATTERY_STATE_URL_TEMPLATE.format(robot_name=robot_name)
@@ -297,6 +328,23 @@ def is_offline(rb: Dict[str, Any]) -> bool:
     return (rb.get("status") or "").upper() == "OFFLINE"
 
 
+def point_in_polygon(x: float, y: float, polygon: List[Tuple[float, float]]) -> bool:
+    """
+    Ray casting: True se (x, y) è dentro il poligono (vertici nell'ordine del perimetro).
+    """
+    inside = False
+    n = len(polygon)
+    x1, y1 = polygon[0]
+    for i in range(1, n + 1):
+        x2, y2 = polygon[i % n]
+        if (y1 > y) != (y2 > y):
+            x_intersect = (x2 - x1) * (y - y1) / (y2 - y1) + x1
+            if x < x_intersect:
+                inside = not inside
+        x1, y1 = x2, y2
+    return inside
+
+
 # -------------------------
 # DynamoDB helpers
 # -------------------------
@@ -361,6 +409,21 @@ def ddb_get_escalated(robot_id: str) -> bool:
     key = f"{ESCALATED_KEY_PREFIX}{robot_id}"
     item = ddb_get_item(key)
     return bool(item.get("escalated", False))
+
+
+def ddb_get_charge_zone_state(robot_id: str) -> Dict[str, Any]:
+    key = f"{CHARGE_ZONE_KEY_PREFIX}{robot_id}"
+    return ddb_get_item(key)
+
+
+def ddb_set_charge_zone_state(robot_id: str, count: int, notified: bool) -> None:
+    key = f"{CHARGE_ZONE_KEY_PREFIX}{robot_id}"
+    ddb_put_item({
+        "robot_id": key,
+        "count": int(count),
+        "notified": bool(notified),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
 
 
 # [BATTERIA DISABILITATA]
@@ -436,6 +499,7 @@ def lambda_handler(event, context):
     robot_alerts: List[str] = []
     offline_alerts: List[str] = []
     escalation_alerts: List[str] = []
+    charge_zone_alerts: List[str] = []
 
     robots_in_error_now: List[Dict[str, Any]] = []
     charge_triggered: List[Dict[str, Any]] = []
@@ -594,6 +658,60 @@ def lambda_handler(event, context):
             else:
                 print(f"ESCALATION già inviata in precedenza per {display_name}, non rinotifico.")
 
+        # ========= CHARGE ZONE CHECK =========
+        # Robot fermo (non in carica) in autonomia dentro l'area di attesa ricarica
+        # per CHARGE_ZONE_MIN_CHECKS controlli consecutivi -> notifica.
+        charging_state_flag = bool(rb.get("charging_state", False))
+        current_mode_upper = (rb.get("current_mode") or "").upper()
+        charge_zone_candidate = (
+            (not charging_state_flag)
+            and (current_mode_upper == "MODE_AUTONOMY")
+            and (not is_offline(rb))
+        )
+
+        if charge_zone_candidate and robot_name:
+            try:
+                state = fetch_robot_state(token=token, robot_name=robot_name)
+                pose = state.get("current_pose") or {}
+                px, py = pose.get("x"), pose.get("y")
+
+                if px is not None and py is not None and point_in_polygon(float(px), float(py), CHARGE_CHECK_POLYGON):
+                    cz = ddb_get_charge_zone_state(robot_id)
+                    cz_count = int(cz.get("count", 0)) + 1
+                    cz_notified = bool(cz.get("notified", False))
+                    print(
+                        f"CHARGE_ZONE: {display_name} in zona ricarica senza caricare "
+                        f"(x={px}, y={py}). Controlli consecutivi: {cz_count}/{CHARGE_ZONE_MIN_CHECKS}"
+                    )
+
+                    if cz_count >= CHARGE_ZONE_MIN_CHECKS and not cz_notified:
+                        cz_notified = True
+                        charge_zone_alerts.append(
+                            f"⚠️ {display_name} è fermo in zona ricarica (x={px:.2f}, y={py:.2f}) con "
+                            f"charging_state=False e current_mode=MODE_AUTONOMY da {cz_count} controlli consecutivi."
+                        )
+                        print(f"CHARGE_ZONE: notifica programmata per {display_name}.")
+
+                    ddb_set_charge_zone_state(robot_id, cz_count, cz_notified)
+                else:
+                    if px is None or py is None:
+                        print(f"CHARGE_ZONE: {display_name} posizione non disponibile (current_pose mancante o incompleto).")
+                    else:
+                        print(f"CHARGE_ZONE: {display_name} fuori dalla zona di ricarica (x={px}, y={py}). Reset contatore.")
+                    cz = ddb_get_charge_zone_state(robot_id)
+                    if int(cz.get("count", 0)) != 0 or bool(cz.get("notified", False)):
+                        ddb_set_charge_zone_state(robot_id, 0, False)
+            except Exception as cze:
+                print(f"CHARGE_ZONE: errore lettura stato/posizione per {display_name}: {cze}")
+        else:
+            print(
+                f"CHARGE_ZONE: {display_name} non candidato "
+                f"(charging_state={charging_state_flag}, current_mode={current_mode_upper}, offline={is_offline(rb)})."
+            )
+            cz = ddb_get_charge_zone_state(robot_id)
+            if int(cz.get("count", 0)) != 0 or bool(cz.get("notified", False)):
+                ddb_set_charge_zone_state(robot_id, 0, False)
+
         # ========= BASSA BATTERIA DISABILITATA =========
         # if robot_name:
         #     try:
@@ -675,6 +793,17 @@ def lambda_handler(event, context):
     else:
         print("Nessuna notifica ESCALATION (o ESCALATION_SNS_TOPIC_ARN non impostato, o nessuna escalation).")
 
+    # ===== Publish SNS: CHARGE ZONE (robot fermo in zona ricarica senza caricare) =====
+    if charge_zone_alerts and topic_arn:
+        notify_sns(
+            topic_arn=topic_arn,
+            subject="AMR – Robot fermo in zona ricarica senza caricare",
+            message="\n".join(charge_zone_alerts)
+        )
+        print("Notifica CHARGE ZONE inviata via SNS.")
+    else:
+        print("Nessuna notifica CHARGE ZONE (o SNS_TOPIC_ARN non impostato, o nessuna condizione rilevata).")
+
     # ===== Publish SNS: BASSA BATTERIA DISABILITATA =====
     # if battery_alerts and topic_arn:
     #     notify_sns(
@@ -750,6 +879,7 @@ def lambda_handler(event, context):
         "robot_alerts_sent": robot_alerts,
         "offline_alerts_sent": offline_alerts,
         "escalation_alerts_sent": escalation_alerts,
+        "charge_zone_alerts_sent": charge_zone_alerts,
         # "battery_alerts_sent": battery_alerts,  # [BATTERIA DISABILITATA]
         "robots_in_error_now": robots_in_error_now,
         "charge_triggered": charge_triggered,
